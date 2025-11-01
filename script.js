@@ -33,7 +33,14 @@ const historySize = 10; // Increase history size to capture more frames
 
 // Add at top with other variables
 let frameSkipCounter = 0;
-let PROCESS_EVERY_N_FRAMES = 2; // adaptive; will tune for mobile
+// Add target FPS for both video and YOLO, and track last YOLO time
+const TARGET_FPS = 15;
+let lastYoloTimestamp = 0;
+// NEW: track when a YOLO result actually arrived and allow waiters
+let lastYoloResultTimestamp = 0;
+let yoloPendingResolvers = [];
+// Process every captured frame (camera will be requested at TARGET_FPS)
+let PROCESS_EVERY_N_FRAMES = 1; // adaptive; will tune for mobile
 let reusableTempCanvas = null; // Reuse canvas
 let yoloCanvas = null; // For letterbox preprocessing
 
@@ -47,6 +54,12 @@ let modelPath = null; // auto-chosen model
 
 // Simple mobile detection + capabilities
 function isMobile() {
+  // Prefer modern userAgentData when available
+  try {
+    if (navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean') {
+      return navigator.userAgentData.mobile;
+    }
+  } catch(e){}
   const ua = navigator.userAgent || navigator.vendor || window.opera;
   return /android|iphone|ipad|ipod|iemobile|mobile/i.test(ua);
 }
@@ -103,7 +116,7 @@ async function startCamera() {
             facingMode: { ideal: "environment" },
             width: { ideal: 1280, max: 1280 },
             height: { ideal: 720, max: 720 },
-            frameRate: { ideal: 30, max: 30 }
+            frameRate: { ideal: TARGET_FPS, max: TARGET_FPS }
           },
           audio: false
         }
@@ -112,7 +125,7 @@ async function startCamera() {
             width: { ideal: 1280 },
             height: { ideal: 720 },
             facingMode: "environment",
-            frameRate: { ideal: 30 }
+            frameRate: { ideal: TARGET_FPS, max: TARGET_FPS }
           },
           audio: false
         };
@@ -135,7 +148,7 @@ async function startCamera() {
             isProcessing = true;
             // Slightly higher skip on mobile to save CPU/GPU
             if (isMobile()) {
-              PROCESS_EVERY_N_FRAMES = 3;
+              PROCESS_EVERY_N_FRAMES = 1;
             }
             // Give one more frame delay before processing
             setTimeout(() => scheduleNextFrame(processVideo), 100);
@@ -576,9 +589,22 @@ async function initYolo() {
         lastDetections = m.dets || [];
         lastYoloMs = m.timeMs || 0;
         yoloRequestInFlight = false;
+        // NEW: mark when worker result arrived
+        lastYoloResultTimestamp = performance.now();
+        // Resolve one pending waiter (if any) with the fresh detections
+        if (yoloPendingResolvers.length) {
+          try {
+            const resolver = yoloPendingResolvers.shift();
+            resolver(lastDetections || []);
+          } catch(e) { /* ignore */ }
+        }
       } else if (m.type === 'error') {
         console.warn('YOLO worker error:', m.error);
         yoloRequestInFlight = false;
+        // resolve any waiters with fallback data
+        while (yoloPendingResolvers.length) {
+          try { yoloPendingResolvers.shift()([]); } catch(e){}
+        }
       }
     });
     return; // Worker ready, skip main-thread ORT init
@@ -815,7 +841,17 @@ function postprocessYolo(output, info, origW, origH) {
   return dets;
 }
 
-async function runYoloOnCanvas(srcCanvas) {
+async function runYoloOnCanvas(srcCanvas, waitForResult = false) {
+  // Throttle YOLO to TARGET_FPS (works for worker and main-thread)
+  const now = performance.now();
+  const minInterval = 1000 / TARGET_FPS;
+  if (now - lastYoloTimestamp < minInterval) {
+    // Too soon to run a new YOLO; return last known detections
+    return lastDetections || [];
+  }
+  // Reserve the timestamp immediately to prevent overlapping launches
+  lastYoloTimestamp = now;
+
   if (yoloWorkerReady) {
     // If worker is ready, prefer it (non-blocking). Only send if no request in flight.
     if (!yoloRequestInFlight) {
@@ -828,7 +864,21 @@ async function runYoloOnCanvas(srcCanvas) {
         yoloRequestInFlight = false;
       }
     }
-    // Return last known detections immediately
+
+    // If caller wants a fresh result, wait (with timeout) for the next worker result
+    if (waitForResult) {
+      return await new Promise((resolve) => {
+        yoloPendingResolvers.push(resolve);
+        // safety timeout (400ms) to avoid blocking UI too long
+        setTimeout(() => {
+          const idx = yoloPendingResolvers.indexOf(resolve);
+          if (idx !== -1) yoloPendingResolvers.splice(idx, 1);
+          resolve(lastDetections || []);
+        }, 400);
+      });
+    }
+
+    // Otherwise return last known detections immediately
     return lastDetections || [];
   }
 
@@ -839,6 +889,8 @@ async function runYoloOnCanvas(srcCanvas) {
   // Use the first output tensor
   const first = output[Object.keys(output)[0]];
   const dets = postprocessYolo(first, info, srcCanvas.width, srcCanvas.height);
+  // mark main-thread run time as result arrival
+  lastYoloResultTimestamp = performance.now();
   return dets;
 }
 
@@ -904,9 +956,17 @@ async function processVideo(){
     let detections = [];
     // Run YOLO (non-blocking via worker if available)
     if (yoloWorkerReady) {
-      // Fire off detection if none in-flight, but don't await
-      runYoloOnCanvas(reusableTempCanvas);
-      detections = lastDetections || [];
+      // If the last worker result is stale, wait briefly for a fresh result to avoid drawing old boxes.
+      const now = performance.now();
+      const stale = (now - (lastYoloResultTimestamp || 0)) > 500; // 500ms threshold
+      if (!yoloRequestInFlight && stale) {
+        // Wait for a fresh worker result (with fallback timeout inside runYoloOnCanvas)
+        detections = await runYoloOnCanvas(reusableTempCanvas, true);
+      } else {
+        // Fire off detection if none in-flight, but don't await
+        runYoloOnCanvas(reusableTempCanvas);
+        detections = lastDetections || [];
+      }
     } else {
       // Fallback: run on main thread and await
       detections = await runYoloOnCanvas(reusableTempCanvas);
